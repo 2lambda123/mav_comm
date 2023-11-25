@@ -34,6 +34,7 @@
 
 #include "mav_msgs/Actuators.h"
 #include "mav_msgs/AttitudeThrust.h"
+#include "mav_msgs/MultiJointTrajectory.h"
 #include "mav_msgs/RateThrust.h"
 #include "mav_msgs/RollPitchYawrateThrust.h"
 #include "mav_msgs/TorqueThrust.h"
@@ -329,14 +330,16 @@ inline void eigenTrajectoryPointFromMsg(
   assert(trajectory_point != NULL);
 
   if (msg.transforms.empty()) {
-    ROS_ERROR("MultiDofJointTrajectoryPoint is empty.");
+    ROS_ERROR(
+        "[eigenTrajectoryPointFromMsg] MultiDofJointTrajectoryPoint is empty.");
     return;
   }
 
-  if (msg.transforms.size() > 1) {
+  if (msg.transforms.size() > 2) {
     ROS_WARN(
-        "MultiDofJointTrajectoryPoint message should have one joint, but has "
-        "%lu. Using first joint.",
+        "MultiDofJointTrajectoryPoint message should have one joint for "
+        "trajectory and a second joint for force, but has "
+        "%lu. Ignoring other joints.",
         msg.transforms.size());
   }
 
@@ -363,6 +366,18 @@ inline void eigenTrajectoryPointFromMsg(
   }
   trajectory_point->jerk_W.setZero();
   trajectory_point->snap_W.setZero();
+
+  // Set desired forces.
+  if (msg.accelerations.size() > 1) {
+    trajectory_point->force_W = vector3FromMsg(msg.accelerations[1].linear);
+    trajectory_point->torque_W = vector3FromMsg(msg.accelerations[1].angular);
+  } else {
+    ROS_WARN_ONCE(
+        "[mav_msgs::conversions] MultiDofJointTrajectoryPoint desired force is "
+        "not given! Setting to zero.");
+    trajectory_point->force_W.setZero();
+    trajectory_point->torque_W.setZero();
+  }
 }
 
 inline void eigenTrajectoryPointVectorFromMsg(
@@ -387,6 +402,110 @@ inline void eigenTrajectoryPointDequeFromMsg(
     eigenTrajectoryPointFromMsg(msg_point, &point);
     trajectory->push_back(point);
   }
+}
+
+inline void eigenTrajectoryDequeFromMsg(const MultiJointTrajectory& msg,
+                                        EigenTrajectoryDeque* trajectory) {
+  if (msg.points.empty()) {
+    ROS_ERROR("[eigenTrajectoryDequeFromMsg] MultiJointTrajectory is empty.");
+    return;
+  }
+
+  assert(trajectory != NULL);
+  trajectory->clear();
+
+  int64_t timestamp_ns = msg.header.stamp.toNSec();
+  for (const auto& msg_point : msg.points) {
+    EigenTrajectory point(msg_point, timestamp_ns);
+    trajectory->push_back(point);
+  }
+}
+
+// This only supports a single joint!
+// Values in the fields corresponding to a second joint are interpreted as
+// force/torque reference and the rest is ignored.
+//
+// Use MultiJointTrajectory message type to support multiple joints
+inline void eigenTrajectoryDequeFromMsg(
+    const trajectory_msgs::MultiDOFJointTrajectory& msg,
+    EigenTrajectoryDeque* trajectory) {
+  if (msg.points.empty()) {
+    ROS_ERROR(
+        "[eigenTrajectoryDequeFromMsg] MultiDOFJointTrajectory is empty.");
+    return;
+  }
+
+  assert(trajectory != NULL);
+  trajectory->clear();
+
+  int64_t timestamp_ns = msg.header.stamp.toNSec();
+
+  // iterate over all time_from_start values
+  for (const auto& msg_point : msg.points) {
+    int64_t time_from_start_ns = msg_point.time_from_start.toNSec();
+    EigenTrajectory point(timestamp_ns, time_from_start_ns);
+
+    EigenTrajectoryPoint joint_state;
+    eigenTrajectoryPointFromMsg(msg_point, &joint_state);
+
+    point.joints.push_back(joint_state);
+
+    // add all joints for specific time_from_start value to overall trajectory
+    trajectory->push_back(point);
+  }
+}
+
+inline void msgMultiJointTrajectoryPointFromEigen(
+    const EigenTrajectory& point, MultiJointTrajectoryPoint* msg) {
+  msg->time_from_start.fromNSec(point.time_from_start_ns);
+  msg->states.clear();
+
+  for (const auto& joint : point.joints) {
+    JointState joint_state;
+    // frames
+    joint_state.frame_id = joint.frame_id;
+    joint_state.parent_id = joint.parent_id;
+
+    // translation
+    vectorEigenToMsg(joint.position_W, &joint_state.transform.translation);
+    vectorEigenToMsg(joint.velocity_W, &joint_state.twist.linear);
+    vectorEigenToMsg(joint.acceleration_W, &joint_state.acceleration.linear);
+    vectorEigenToMsg(joint.jerk_W, &joint_state.jerk.linear);
+
+    // rotation
+    quaternionEigenToMsg(joint.orientation_W_B,
+                         &joint_state.transform.rotation);
+    vectorEigenToMsg(joint.angular_velocity_W, &joint_state.twist.angular);
+    vectorEigenToMsg(joint.angular_acceleration_W,
+                     &joint_state.acceleration.angular);
+    vectorEigenToMsg(joint.angular_jerk_W, &joint_state.jerk.angular);
+
+    // interaction forces
+    vectorEigenToMsg(joint.force_W, &joint_state.wrench.force);
+    vectorEigenToMsg(joint.torque_W, &joint_state.wrench.torque);
+    vectorEigenToMsg(joint.force_d_W, &joint_state.wrench_derivative.force);
+    vectorEigenToMsg(joint.torque_d_W, &joint_state.wrench_derivative.torque);
+
+    msg->states.push_back(joint_state);
+  }
+}
+
+inline void msgMultiJointTrajectoryFromEigen(
+    const EigenTrajectoryDeque& trajectory, MultiJointTrajectory* msg) {
+  msg->points.clear();
+  for (const auto& point : trajectory) {
+    MultiJointTrajectoryPoint point_msg;
+    msgMultiJointTrajectoryPointFromEigen(point, &point_msg);
+    msg->points.push_back(point_msg);
+  }
+}
+
+inline void msgMultiJointTrajectoryFromEigen(const EigenTrajectory& point,
+                                             MultiJointTrajectory* msg) {
+  EigenTrajectoryDeque trajectory;
+  trajectory.clear();
+  trajectory.push_back(point);
+  msgMultiJointTrajectoryFromEigen(trajectory, msg);
 }
 
 // In all these conversions, client is responsible for filling in message
@@ -476,7 +595,7 @@ inline void msgMultiDofJointTrajectoryPointFromEigen(
   msg->time_from_start.fromNSec(trajectory_point.time_from_start_ns);
   msg->transforms.resize(1);
   msg->velocities.resize(1);
-  msg->accelerations.resize(1);
+  msg->accelerations.resize(2);
 
   vectorEigenToMsg(trajectory_point.position_W,
                    &msg->transforms[0].translation);
@@ -489,6 +608,9 @@ inline void msgMultiDofJointTrajectoryPointFromEigen(
                    &msg->accelerations[0].linear);
   vectorEigenToMsg(trajectory_point.angular_acceleration_W,
                    &msg->accelerations[0].angular);
+
+  vectorEigenToMsg(trajectory_point.force_W, &msg->accelerations[1].linear);
+  vectorEigenToMsg(trajectory_point.torque_W, &msg->accelerations[1].angular);
 }
 
 inline void msgMultiDofJointTrajectoryFromEigen(
